@@ -264,25 +264,31 @@ class NotificationProcessor:
     ) -> Notification:
         """
         Create a SINGLE notification with all recipients in array columns.
-
-        Args:
-            db: Database session
-            payload: Notification payload with recipients list
-
-        Returns:
-            Created Notification object
         """
-        # Build notification data
-        notification_data = {
-            "title": payload.notification.title,
-            "message": payload.notification.message,
-            "action_url": payload.notification.action_url,
-            "changes": payload.notification.changes,
-            "extra": payload.notification.extra,
-        }
-
-        # Remove None values
-        notification_data = {k: v for k, v in notification_data.items() if v is not None}
+        # Build notification data - FLAT structure for frontend compatibility
+        notification_data = {}
+        
+        # Add message (required)
+        if payload.notification.message:
+            notification_data["message"] = payload.notification.message
+        
+        # Add title
+        if payload.notification.title:
+            notification_data["title"] = payload.notification.title
+        
+        # Add action_url if present
+        if payload.notification.action_url:
+            notification_data["action_url"] = payload.notification.action_url
+        
+        # Add changes if present (keep as-is for backward compat)
+        if payload.notification.changes:
+            notification_data["changes"] = payload.notification.changes
+        
+        # FLATTEN extra fields into the root of notification_data
+        if payload.notification.extra:
+            for key, value in payload.notification.extra.items():
+                if value is not None:
+                    notification_data[key] = value
 
         # Aggregate all recipients into their respective arrays
         notifiable_users = []
@@ -307,7 +313,6 @@ class NotificationProcessor:
                 if recipient_id and recipient_id not in notifiable_companies:
                     notifiable_companies.append(recipient_id)
             else:
-                # Default to user
                 if recipient_id and recipient_id not in notifiable_users:
                     notifiable_users.append(recipient_id)
 
@@ -327,13 +332,13 @@ class NotificationProcessor:
             task_id=payload.task_id,
             company_id=payload.company_id,
             work_item_type_id=payload.work_item_type_id,
-            data=json.dumps(notification_data),
+            data=json.dumps(notification_data),  # Flat structure
             auto_reminder=False,
             created_at=datetime.utcnow(),
         )
 
         db.add(notification)
-        db.flush()  # Ensure notification is flushed to DB before returning
+        db.flush()
         return notification
 
     # -------------------------------------------------------------------------
