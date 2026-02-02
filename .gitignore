@@ -1,0 +1,30 @@
+# OS junk
+.DS_Store
+Thumbs.db
+ 
+# Logs
+*.log
+logs/*
+logs/.*log
+ 
+# Env / secrets
+.env
+.env.*
+!.env.example
+ 
+# App runtime uploads (local storage)
+uploads/
+!uploads/.gitkeep
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+.conda/
+pythonenv*
+
+# Byte-compiled / optimized / DLL files
+/__pycache__/
+/*/__pycache__/*.pyc
+/*/*/__pycache__/*.pyc
