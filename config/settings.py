@@ -65,9 +65,9 @@ class Settings(BaseSettings):
     RABBITMQ_CONNECTION_ATTEMPTS: Optional[int] = 5
     RABBITMQ_RETRY_DELAY: Optional[int] = 2
 
-    RABBITMQ_EXCHANGE: Optional[str] = "notifications.exchange"
+    RABBITMQ_EXCHANGE: Optional[str] = "notifications"
     RABBITMQ_QUEUE: Optional[str] = "notifications.process"
-    RABBITMQ_ROUTING_KEY: Optional[str] = "notification"
+    RABBITMQ_ROUTING_KEY: Optional[str] = "notification.created"
     RABBITMQ_PREFETCH_COUNT: Optional[int] = 20
 
     # -------------------------------------------------------------------------

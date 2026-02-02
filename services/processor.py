@@ -9,7 +9,7 @@ import json
 import logging
 from uuid import uuid4
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -18,7 +18,6 @@ from config.settings import settings
 from database import get_db_session
 from redis_manager import online_status_manager
 from models.notification import Notification
-# Note: scope_type is used as string, not enum (for flexibility)
 from schemas.notification import (
     NotificationPayload,
     NotificationRecipient,
@@ -32,12 +31,16 @@ logger = logging.getLogger(__name__)
 class SavedNotification:
     """Holds notification data after saving to database."""
     id: str
-    user_id: int
     type: str
     data: dict
     ticket_id: Optional[int]
     task_id: Optional[int]
     created_at: datetime
+    # Aggregated target arrays
+    notifiable_users: Optional[List[int]]
+    notifiable_teams: Optional[List[int]]
+    notifiable_departments: Optional[List[int]]
+    notifiable_companies: Optional[List[int]]
 
 
 @dataclass
@@ -67,7 +70,7 @@ class NotificationProcessor:
 
     Responsibilities:
     1. Parse and validate incoming messages
-    2. Save notifications to database
+    2. Save SINGLE notification to database with aggregated targets
     3. Check online status via Redis
     4. Deliver to online users via WebSocket
     """
@@ -113,32 +116,37 @@ class NotificationProcessor:
                 f"recipients={len(payload.recipients)}, ticket_id={payload.ticket_id}"
             )
 
-            # Extract recipient user IDs
-            recipient_ids = [r.user_id for r in payload.recipients]
+            # Extract all user IDs from recipients (only users, not teams/depts/companies)
+            user_recipient_ids = [
+                r.user_id for r in payload.recipients 
+                if (getattr(r, 'scope_type', 'user') or 'user') == 'user'
+            ]
 
-            # Step 1: Save notifications to database
-            notifications = self._save_notifications(payload)
-            saved_count = len(notifications)
+            # Step 1: Save SINGLE notification to database with aggregated targets
+            saved_notification = self._save_notification(payload)
+            saved_count = 1 if saved_notification else 0
 
-            # Step 2: Check online status
-            online_users = online_status_manager.get_online_users(recipient_ids)
+            # Step 2: Check online status for user recipients
+            online_users = {}
+            if user_recipient_ids:
+                online_users = online_status_manager.get_online_users(user_recipient_ids)
             online_count = len(online_users)
 
-            # Step 3: Deliver to online users
+            # Step 3: Deliver to online users via WebSocket
             delivered_count = 0
-            if self._websocket_emitter and online_users:
-                delivered_count = await self._deliver_notifications(
-                    notifications, online_users
+            if self._websocket_emitter and online_users and saved_notification:
+                delivered_count = await self._deliver_to_users(
+                    saved_notification, online_users
                 )
 
             # Build result
             result = ProcessingResult(
-                total_recipients=len(recipient_ids),
+                total_recipients=len(payload.recipients),
                 saved_count=saved_count,
                 online_count=online_count,
                 delivered_count=delivered_count,
-                failed_count=len(recipient_ids) - saved_count,
-                notification_ids=[n.id for n in notifications]  # Now works - SavedNotification has id
+                failed_count=0 if saved_count > 0 else 1,
+                notification_ids=[saved_notification.id] if saved_notification else []
             )
 
             logger.info(
@@ -185,6 +193,7 @@ class NotificationProcessor:
                         ticket_id=message.get("ticket_id"),
                         task_id=message.get("task_id"),
                         company_id=message.get("company_id"),
+                        work_item_type_id=message.get("work_item_type_id"),
                     )
             except Exception as e2:
                 logger.error(f"Failed to parse minimal payload: {e2}")
@@ -195,79 +204,70 @@ class NotificationProcessor:
     # DATABASE OPERATIONS
     # -------------------------------------------------------------------------
 
-    def _save_notifications(self, payload: NotificationPayload) -> List[SavedNotification]:
+    def _save_notification(self, payload: NotificationPayload) -> Optional[SavedNotification]:
         """
-        Save notifications to database for all recipients.
+        Save a SINGLE notification to database with all recipients aggregated.
 
         Args:
             payload: Validated notification payload
 
         Returns:
-            List of SavedNotification with data captured before session closes
+            SavedNotification or None if failed
         """
-        saved_notifications = []
-
         with get_db_session() as db:
-            notifications = []
-            for recipient in payload.recipients:
-                try:
-                    notification = self._create_notification(
-                        db=db,
-                        recipient=recipient,
-                        payload=payload
-                    )
-                    notifications.append(notification)
-
-                except Exception as e:
-                    logger.error(
-                        f"Failed to save notification for user {recipient.user_id}: {e}"
-                    )
-
-            # Commit all notifications in a single transaction
             try:
+                notification = self._create_single_notification(db=db, payload=payload)
+
+                # Commit the single notification
                 db.commit()
 
-                # Capture data BEFORE session closes (objects will be detached after)
-                for n in notifications:
-                    # Parse data JSON string to dict
-                    data = n.data
-                    if isinstance(data, str):
-                        try:
-                            data = json.loads(data)
-                        except:
-                            data = {}
+                # Parse data JSON string to dict
+                data = notification.data
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except:
+                        data = {}
 
-                    saved_notifications.append(SavedNotification(
-                        id=n.id,
-                        user_id=n.notifiable_id,
-                        type=n.type,
-                        data=data,
-                        ticket_id=n.ticket_id,
-                        task_id=n.task_id,
-                        created_at=n.created_at,
-                    ))
+                saved = SavedNotification(
+                    id=notification.id,
+                    type=notification.type,
+                    data=data,
+                    ticket_id=notification.ticket_id,
+                    task_id=notification.task_id,
+                    created_at=notification.created_at,
+                    notifiable_users=notification.notifiable_users,
+                    notifiable_teams=notification.notifiable_teams,
+                    notifiable_departments=notification.notifiable_departments,
+                    notifiable_companies=notification.notifiable_companies,
+                )
 
-                logger.debug(f"Committed {len(saved_notifications)} notifications to database")
+                logger.info(
+                    f"Saved notification {notification.id}: "
+                    f"users={len(notification.notifiable_users or [])}, "
+                    f"teams={len(notification.notifiable_teams or [])}, "
+                    f"depts={len(notification.notifiable_departments or [])}, "
+                    f"companies={len(notification.notifiable_companies or [])}"
+                )
+
+                return saved
+
             except Exception as e:
-                logger.error(f"Failed to commit notifications: {e}")
+                logger.error(f"Failed to save notification: {e}", exc_info=True)
                 db.rollback()
-                return []
+                return None
 
-        return saved_notifications
-
-    def _create_notification(
+    def _create_single_notification(
         self,
         db: Session,
-        recipient: NotificationRecipient,
         payload: NotificationPayload
     ) -> Notification:
         """
-        Create a single notification record.
+        Create a SINGLE notification with all recipients in array columns.
 
         Args:
             db: Database session
-            recipient: Recipient information
-            payload: Notification payload
+            payload: Notification payload with recipients list
 
         Returns:
             Created Notification object
@@ -284,33 +284,45 @@ class NotificationProcessor:
         # Remove None values
         notification_data = {k: v for k, v in notification_data.items() if v is not None}
 
-        # Determine which array to populate based on scope_type
-        notifiable_users = None
-        notifiable_teams = None
-        notifiable_departments = None
-        notifiable_companies = None
+        # Aggregate all recipients into their respective arrays
+        notifiable_users = []
+        notifiable_teams = []
+        notifiable_departments = []
+        notifiable_companies = []
 
-        scope_type = getattr(recipient, 'scope_type', 'user') or 'user'
-        if scope_type == 'user':
-            notifiable_users = [recipient.user_id]
-        elif scope_type == 'team':
-            notifiable_teams = [recipient.user_id]  # user_id contains team_id in this case
-        elif scope_type == 'department':
-            notifiable_departments = [recipient.user_id]  # user_id contains dept_id
-        elif scope_type == 'company':
-            notifiable_companies = [recipient.user_id]  # user_id contains company_id
-        else:
-            notifiable_users = [recipient.user_id]  # Default to user
+        for recipient in payload.recipients:
+            scope_type = getattr(recipient, 'scope_type', 'user') or 'user'
+            recipient_id = recipient.user_id
+
+            if scope_type == 'user':
+                if recipient_id and recipient_id not in notifiable_users:
+                    notifiable_users.append(recipient_id)
+            elif scope_type == 'team':
+                if recipient_id and recipient_id not in notifiable_teams:
+                    notifiable_teams.append(recipient_id)
+            elif scope_type == 'department':
+                if recipient_id and recipient_id not in notifiable_departments:
+                    notifiable_departments.append(recipient_id)
+            elif scope_type == 'company':
+                if recipient_id and recipient_id not in notifiable_companies:
+                    notifiable_companies.append(recipient_id)
+            else:
+                # Default to user
+                if recipient_id and recipient_id not in notifiable_users:
+                    notifiable_users.append(recipient_id)
+
+        # Get primary user_id for notifiable_id (backward compatibility)
+        primary_user_id = notifiable_users[0] if notifiable_users else 0
 
         notification = Notification(
             id=str(uuid4()),
             type=payload.event_type,
             notifiable_type=payload.event_type,
-            notifiable_id=recipient.user_id,
-            notifiable_users=notifiable_users,
-            notifiable_teams=notifiable_teams,
-            notifiable_departments=notifiable_departments,
-            notifiable_companies=notifiable_companies,
+            notifiable_id=primary_user_id,
+            notifiable_users=notifiable_users if notifiable_users else None,
+            notifiable_teams=notifiable_teams if notifiable_teams else None,
+            notifiable_departments=notifiable_departments if notifiable_departments else None,
+            notifiable_companies=notifiable_companies if notifiable_companies else None,
             ticket_id=payload.ticket_id,
             task_id=payload.task_id,
             company_id=payload.company_id,
@@ -321,22 +333,23 @@ class NotificationProcessor:
         )
 
         db.add(notification)
+        db.flush()  # Ensure notification is flushed to DB before returning
         return notification
 
     # -------------------------------------------------------------------------
     # WEBSOCKET DELIVERY
     # -------------------------------------------------------------------------
 
-    async def _deliver_notifications(
+    async def _deliver_to_users(
         self,
-        notifications: List[SavedNotification],
+        notification: SavedNotification,
         online_users: Dict[int, str]
     ) -> int:
         """
-        Deliver notifications to online users via WebSocket.
+        Deliver notification to all online users in the notifiable_users array.
 
         Args:
-            notifications: List of SavedNotification objects
+            notification: SavedNotification with aggregated targets
             online_users: Dict mapping user_id to socket_id
 
         Returns:
@@ -344,9 +357,10 @@ class NotificationProcessor:
         """
         delivered_count = 0
 
-        for notification in notifications:
-            user_id = notification.user_id
+        # Get all target user IDs
+        target_user_ids = notification.notifiable_users or []
 
+        for user_id in target_user_ids:
             if user_id not in online_users:
                 continue
 
