@@ -35,6 +35,7 @@ class SavedNotification:
     data: dict
     ticket_id: Optional[int]
     task_id: Optional[int]
+    work_item_type_id: Optional[int]
     created_at: datetime
     # Aggregated target arrays
     notifiable_users: Optional[List[int]]
@@ -235,6 +236,7 @@ class NotificationProcessor:
                     data=data,
                     ticket_id=notification.ticket_id,
                     task_id=notification.task_id,
+                    work_item_type_id=notification.work_item_type_id,
                     created_at=notification.created_at,
                     notifiable_users=notification.notifiable_users,
                     notifiable_teams=notification.notifiable_teams,
@@ -393,16 +395,28 @@ class NotificationProcessor:
             notification: SavedNotification instance
 
         Returns:
-            Dictionary for WebSocket emission
+            Dictionary for WebSocket emission (matching frontend expected format)
         """
+        created_at_str = notification.created_at.isoformat() if notification.created_at else None
+
         return {
             "id": notification.id,
             "type": notification.type,
             "notifiable_type": notification.type,
-            "data": notification.data,
+            "notifiable_id": notification.notifiable_users[0] if notification.notifiable_users else None,
+            "work_item_type_id": notification.work_item_type_id,
+            "notifiable_users": notification.notifiable_users,
+            "notifiable_teams": notification.notifiable_teams,
+            "notifiable_departments": notification.notifiable_departments,
+            "notifiable_companies": notification.notifiable_companies,
             "ticket_id": notification.ticket_id,
             "task_id": notification.task_id,
-            "created_at": notification.created_at.isoformat() if notification.created_at else None,
+            "data": notification.data,
+            "read_at": None,
+            "created_at": created_at_str,
+            "updated_at": created_at_str,
+            "schedule_at": None,
+            "meta_data": None,
         }
 
 
