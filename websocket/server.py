@@ -46,6 +46,8 @@ socket_app = socketio.ASGIApp(sio, socketio_path="")
 # SERIALIZATION
 # =============================================================================
 
+#new line
+
 # Binary format flags (compatible with main project)
 BINARY_FORMAT_FLAG = b"\x01"
 JSON_FORMAT_FLAG = b"\x00"
